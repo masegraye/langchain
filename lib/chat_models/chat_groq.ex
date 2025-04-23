@@ -11,6 +11,7 @@ defmodule LangChain.ChatModels.ChatGroq do
   - Support for streaming responses
   - Tool/function calling capabilities
   - Proper error handling for Groq-specific responses
+  - Custom parser for Llama-3.1 series models
   
   ## Configuration
   
@@ -82,6 +83,7 @@ defmodule LangChain.ChatModels.ChatGroq do
   alias LangChain.LangChainError
   alias LangChain.Utils
   alias LangChain.Callbacks
+  alias LangChain.Utils.Parser.LLAMA_3_1_CustomToolParser
 
   @behaviour ChatModel
 
@@ -624,7 +626,66 @@ defmodule LangChain.ChatModels.ChatGroq do
     end
   end
 
-  # Complete message with tool calls
+  # Special handling for Llama 3.1 series models with custom function format
+  def do_process_response(
+        %{model: model_name} = model,
+        %{"finish_reason" => finish_reason, "message" => %{"content" => "<function=" <> _ = content} = message} = data
+      )
+      when finish_reason in ["tool_calls", "stop"] and is_binary(model_name) do
+    
+    # Check if this is a Llama 3.1 model
+    is_llama_3_1 = String.contains?(model_name, "llama-3.1") or 
+                   String.contains?(model_name, "llama3-1") or
+                   String.contains?(model_name, "llama3.1")
+                   
+    if is_llama_3_1 do
+    
+    # Check if NimbleParsec is loaded for the custom parser
+    if Code.ensure_loaded?(NimbleParsec) do
+      # Apply the custom parser for Llama 3.1 models
+      case LLAMA_3_1_CustomToolParser.parse(content) do
+        {:ok, %{function_name: name, parameters: parameters}} ->
+          tool_call = ToolCall.new!(%{
+            call_id: "llama_3_1_call",
+            name: name,
+            arguments: parameters,
+            status: :complete
+          })
+          
+          case Message.new(%{
+                "role" => "assistant",
+                "content" => content,
+                "complete" => true,
+                "index" => data["index"],
+                "tool_calls" => [tool_call]
+              }) do
+            {:ok, msg} -> msg
+            {:error, changeset} -> {:error, LangChainError.exception(changeset)}
+          end
+        
+        {:error, _} -> 
+          # Fall back to normal message if parsing fails
+          case Message.new(%{
+                 "role" => "assistant",
+                 "content" => content,
+                 "complete" => true,
+                 "index" => data["index"]
+               }) do
+            {:ok, msg} -> msg
+            {:error, changeset} -> {:error, LangChainError.exception(changeset)}
+          end
+      end
+    else
+      # If NimbleParsec isn't loaded, process normally
+      fallback_process_message(model, message, data)
+    end
+    else
+      # Not a Llama 3.1 model, process message normally
+      fallback_process_message(model, message, data)
+    end
+  end
+  
+  # Complete message with tool calls (standard OpenAI format)
   def do_process_response(
         model,
         %{"finish_reason" => finish_reason, "message" => %{"tool_calls" => calls} = message} = data
@@ -647,6 +708,19 @@ defmodule LangChain.ChatModels.ChatGroq do
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, LangChainError.exception(changeset)}
+    end
+  end
+  
+  # Helper function for fallback processing
+  defp fallback_process_message(_model, message, data) do
+    case Message.new(%{
+           "role" => "assistant",
+           "content" => message["content"],
+           "complete" => true,
+           "index" => data["index"]
+         }) do
+      {:ok, msg} -> msg
+      {:error, changeset} -> {:error, LangChainError.exception(changeset)}
     end
   end
 
